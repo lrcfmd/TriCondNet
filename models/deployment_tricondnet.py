@@ -12,7 +12,7 @@ import pickle as pkl
 import matplotlib.pyplot as plt
 from sklearn.model_selection import GroupShuffleSplit, GroupKFold, RandomizedSearchCV
 from lightgbm import LGBMClassifier
-
+from CBFV import composition
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 sys.path.insert(0, str(Path.cwd().parent.parent))
@@ -26,6 +26,13 @@ def _set_all_seeds(seed: int):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+def remove_formula_from_training(data, cbfv, formulae):
+    for formula in formulae: 
+        data = data[data['formula']!=formula]
+    data = data.reset_index(drop=True)
+    data.to_csv(Path.cwd() / "temporary_data" / f"training_{cbfv}.csv", index=False)
+
     
 def architecture_generator(arch_style, brick_width, funnel_width, n_layers, funnel_rate=None): 
     if arch_style=="brick":
@@ -40,7 +47,28 @@ def architecture_generator(arch_style, brick_width, funnel_width, n_layers, funn
             architecture = architecture + ([current_layer],)
             current_layer = max(1, int(current_layer * funnel_rate))
         return architecture
-    
+
+def convert_formula_to_features(list_of_formulae, list_of_temps, cbfv="magpie"):
+    final_df = pd.DataFrame()
+    cbfv = "magpie"
+    for formula in list_of_formulae:
+        input = pd.DataFrame({"formula": formula, "target": [0]})
+        X, _, formulae, skipped = composition.generate_features(input,
+                                                                elem_prop=cbfv,
+                                                                drop_duplicates=False,
+                                                                extend_features=True,
+                                                                sum_feat=True,
+                                                                )
+        n = len(list_of_temps)
+        AppendedData = pd.concat([X.loc[[0]]] * n, ignore_index=True)
+        AppendedData["temp"] = list_of_temps # In Kelvin
+        AppendedData["formula"] = [formula] * n
+        AppendedData["entry"] = "No entry"
+        AppendedData["source"] = "Generated"
+        final_df = pd.concat([final_df, AppendedData], ignore_index=True)
+    return final_df
+
+         
 class GBM_ClassifierDeployment:
     def __init__(
         self,
@@ -379,13 +407,10 @@ class Metal_Deployment:
             )
             Train = DataToSplit.iloc[Train_Idx]
             Val = DataToSplit.iloc[Validation_Idx]
-            Train = Train.drop_duplicates(subset="formula").reset_index(drop=True)
-            Val = Val.drop_duplicates(subset="formula").reset_index(drop=True)
             Train, Val = Train[Train["class"]==1].reset_index(drop=True), Val[Val["class"]==1].reset_index(drop=True)
             self.train = self.data_indexer(data=Train, index=None, feature_columns=Feature_Columns)
             self.val = self.data_indexer(data=Val, index=None, feature_columns=Feature_Columns)
         else:
-            DataToSplit = DataToSplit.drop_duplicates(subset="formula")
             DataToSplit = DataToSplit[DataToSplit["class"]==1].reset_index(drop=True)
             self.train = self.data_indexer(data=DataToSplit, index=None, feature_columns=Feature_Columns)
 
@@ -549,13 +574,10 @@ class Semiconductor_Deployment:
             )
             Train = DataToSplit.iloc[Train_Idx]
             Val = DataToSplit.iloc[Validation_Idx]
-            Train = Train.drop_duplicates(subset="formula").reset_index(drop=True)
-            Val = Val.drop_duplicates(subset="formula").reset_index(drop=True)
             Train, Val = Train[Train["class"]==0].reset_index(drop=True), Val[Val["class"]==0].reset_index(drop=True)
             self.train = self.data_indexer(data=Train, index=None, feature_columns=Feature_Columns)
             self.val = self.data_indexer(data=Val, index=None, feature_columns=Feature_Columns)
         else:
-            DataToSplit = DataToSplit.drop_duplicates(subset="formula")
             DataToSplit = DataToSplit[DataToSplit["class"]==0].reset_index(drop=True)
             self.train = self.data_indexer(data=DataToSplit, index=None, feature_columns=Feature_Columns)
 
@@ -643,6 +665,7 @@ class Semiconductor_Deployment:
                 patience=patience_num,
                 xscale="standard",
                 verbose=False,
+                warm_start_epochs=50,
             )
         else:
             history = regressor.fit(

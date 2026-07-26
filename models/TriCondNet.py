@@ -11,9 +11,10 @@ from sklearn.pipeline import Pipeline
 from typing import List, Optional, Tuple, Union
 import copy
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-
+from scipy.optimize import curve_fit
+from scipy.optimize import OptimizeWarning
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
+import warnings 
 K_BOLTZ = 8.617333262145e-5
 _LN10 = math.log(10.0)
 
@@ -22,170 +23,11 @@ def _leaky_clamp(x, min_val, max_val, leak=0.01):
     clamped = torch.clamp(x, min_val, max_val)
     return clamped + leak * (x - clamped)
 
-
-def _composition_groups(train_df: pd.DataFrame):
-    cols = [c for c in train_df.columns if c != "temp"]
-    arr = np.ascontiguousarray(np.asarray(train_df[cols], dtype=float))
-    groups = {}
-    for pos in range(arr.shape[0]):
-        groups.setdefault(arr[pos].tobytes(), []).append(pos)
-    return list(groups.values())
+def metal_oxide_law(x, A, n, B):
+    return -np.log10(A * (x/500)**n + B)
 
 
-def _quality_weights(fit_mae, scale=0.1):
-    """Down-weight compositions the closed-form model describes poorly."""
-    return 1.0 / (1.0 + np.asarray(fit_mae, dtype=float) / scale)
-
-
-def semiconductor_warmstart_targets(train_df, train_target, target_name="target",
-                                    min_points=2):
-    """Per-composition (lnA, Ea) from OLS of log10(sigma) on 1/T."""
-    y_all = np.asarray(train_target[target_name], dtype=float)
-    T_all = np.asarray(train_df["temp"], dtype=float)
-
-    rows, params, maes = [], [], []
-    for grp in _composition_groups(train_df):
-        if len(grp) < min_points:
-            continue
-        T, y = T_all[grp], y_all[grp]
-        x = 1.0 / T
-        if np.ptp(x) < 1e-12:                     # single temperature: unidentifiable
-            continue
-        slope, intercept = np.polyfit(x, y, 1)
-        rows.append(grp[0])
-        params.append((intercept * _LN10, -slope * _LN10 * K_BOLTZ))
-        maes.append(float(np.mean(np.abs(y - (intercept + slope * x)))))
-
-    if not rows:
-        return None
-    maes = np.asarray(maes, dtype=float)
-    return {"rows": np.asarray(rows, dtype=int),
-            "params": np.asarray(params, dtype=float),
-            "weights": np.repeat(_quality_weights(maes)[:, None], 2, axis=1),
-            "fit_mae": maes}
-
-
-def metal_warmstart_targets(train_df, train_target, target_name="target",
-                            min_points=3, n_max=4.0, n_steps=201,
-                            identifiable_only=True, share_tol=0.05, irls_iters=6):
-    """Per-composition (lnA, lnBrel, n) for rho = A*(T/500)^n + B.
-
-    n is found by a grid search (a local optimiser converges to a degenerate
-    solution whenever one term dominates rho); A and B follow in closed form at
-    each n from an IRLS-weighted linear least squares, weighted so the residual
-    is minimised in log space.
-
-    With ``identifiable_only`` the degenerate compositions are simply left out
-    of stage 1 - they still take part in the physics loss. Otherwise they are
-    kept, with the parameter their data cannot determine replaced by the
-    population median and down-weighted.
-    """
-    y_all = np.asarray(train_target[target_name], dtype=float)
-    T_all = np.asarray(train_df["temp"], dtype=float)
-    n_grid = np.linspace(0.0, n_max, n_steps)
-
-    recs = []
-    for grp in _composition_groups(train_df):
-        if len(grp) < min_points:
-            continue
-        T, y = T_all[grp], y_all[grp]
-        if len(np.unique(T)) < 3:                 # need 3 distinct T for 3 parameters
-            continue
-        rho = np.power(10.0, -y)
-        U = np.power(T[None, :] / 500.0, n_grid[:, None])
-        W = np.repeat((1.0 / np.clip(rho, 1e-300, None) ** 2)[None, :], n_steps, axis=0)
-
-        A = B = None
-        for _ in range(irls_iters):
-            Suu = (W * U * U).sum(1); Su = (W * U).sum(1); Sw = W.sum(1)
-            Suy = (W * U * rho).sum(1); Sy = (W * rho).sum(1)
-            det = Suu * Sw - Su * Su
-            safe = np.where(np.abs(det) > 1e-300, det, 1.0)
-            A = np.clip((Suy * Sw - Su * Sy) / safe, 1e-30, None)
-            B = np.clip((Suu * Sy - Su * Suy) / safe, 1e-30, None)
-            W = 1.0 / np.clip(A[:, None] * U + B[:, None], 1e-30, None) ** 2
-
-        pred = A[:, None] * U + B[:, None]
-        resid = np.abs(-np.log10(np.clip(pred, 1e-300, None)) - y[None, :]).mean(1)
-        k = int(np.argmin(resid))
-        Ak, Bk, nk = float(A[k]), float(B[k]), float(n_grid[k])
-        share = Ak * U[k] / (Ak * U[k] + Bk)      # fraction of rho carried by the A term
-        recs.append({"row": grp[0], "lnA": math.log(Ak), "lnBrel": math.log(Bk / Ak),
-                     "n": nk, "mae": float(resid[k]),
-                     "smin": float(share.min()), "smax": float(share.max())})
-
-    if not recs:
-        return None
-
-    ident = [r for r in recs if r["smax"] >= share_tol and r["smin"] <= 1.0 - share_tol]
-
-    if identifiable_only or not ident:
-        keep = ident if ident else recs
-        maes = np.array([r["mae"] for r in keep])
-        print(f"[warm-start] metal: {len(keep)}/{len(recs)} compositions identifiable")
-        return {"rows": np.array([r["row"] for r in keep], dtype=int),
-                "params": np.array([[r["lnA"], r["lnBrel"], r["n"]] for r in keep]),
-                "weights": np.repeat(_quality_weights(maes)[:, None], 3, axis=1),
-                "fit_mae": maes}
-
-    med = {k: float(np.median([r[k] for r in ident])) for k in ("lnA", "lnBrel", "n")}
-    rows, params, weights, maes = [], [], [], []
-    for r in recs:
-        lnA, lnBrel, n = r["lnA"], r["lnBrel"], r["n"]
-        w3 = np.ones(3)
-        if r["smax"] < share_tol:                 # B dominates: only lnB = lnA + lnBrel is fixed
-            lnB = lnA + lnBrel
-            lnA, lnBrel, n = med["lnA"], lnB - med["lnA"], med["n"]
-            w3 = np.array([0.3, 1.0, 0.3])
-        elif r["smin"] > 1.0 - share_tol:         # A dominates: lnBrel is unconstrained
-            lnBrel = med["lnBrel"]
-            w3 = np.array([1.0, 0.3, 1.0])
-        rows.append(r["row"]); params.append([lnA, lnBrel, n]); maes.append(r["mae"])
-        weights.append(w3 * float(_quality_weights([r["mae"]])[0]))
-    print(f"[warm-start] metal: {len(ident)}/{len(recs)} identifiable, "
-          f"{len(recs) - len(ident)} kept with a median prior")
-    return {"rows": np.array(rows, dtype=int), "params": np.array(params),
-            "weights": np.array(weights), "fit_mae": np.array(maes)}
-
-
-def _run_pretrain(obj, X_scaled, targets, weights, epochs, lr, weight_decay,
-                  batch_size, verbose=False):
-    """Stage 1: regress the physical parameters directly, one row per composition.
-
-    Targets are standardised by their own spread so the heads train at
-    comparable rates. Uses obj._extract_params, so the clamps and transforms are
-    exactly the ones the physics loss will see in stage 2.
-    """
-    Xt = torch.FloatTensor(np.asarray(X_scaled, dtype=float)).to(device)
-    Y = torch.FloatTensor(np.asarray(targets, dtype=float)).to(device)
-    Wt = torch.FloatTensor(np.asarray(weights, dtype=float)).to(device)
-    sd = Y.std(dim=0, keepdim=True).clamp_min(1e-6)
-
-    optimizer = optim.Adam(obj.model.parameters(), lr=lr, weight_decay=weight_decay)
-    n = Xt.shape[0]
-    bs = max(8, min(int(batch_size), n))
-    obj.model.train()
-    obj.pretrain_history = []
-
-    for ep in range(int(epochs)):
-        perm = torch.randperm(n, device=device)
-        total, nb = 0.0, 0
-        for i in range(0, n, bs):
-            idx = perm[i:i + bs]
-            optimizer.zero_grad()
-            pred = torch.cat(obj._extract_params(obj.model(Xt[idx])), dim=1)
-            loss = (Wt[idx] * ((pred - Y[idx]) / sd) ** 2).mean()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(obj.model.parameters(), max_norm=1.0)
-            optimizer.step()
-            total += loss.item(); nb += 1
-        obj.pretrain_history.append(total / max(nb, 1))
-        if verbose and (ep + 1) % 50 == 0:
-            print(f"  [pretrain] epoch {ep + 1}/{epochs}  loss={obj.pretrain_history[-1]:.5f}")
-
-    print(f"[pretrain] {epochs} epochs on {n} compositions; "
-          f"loss {obj.pretrain_history[0]:.4f} -> {obj.pretrain_history[-1]:.4f}")
-    return obj.pretrain_history
+# Semiconductor PINN warm start - pretraining based on modelled physical parameters 
 
 
 class MetalPINN:
@@ -236,6 +78,40 @@ class MetalPINN:
             return nn.Identity()
         else: 
             raise ValueError("Invalid Activation Function Used")
+    
+    def warm_start(self, X_values, temps, y, epochs=100, lr=1e-1):
+        uniques, comp_id = np.unique(X_values, axis=0, return_inverse=True)
+        # grouping now 
+        df = pd.DataFrame({"T": temps, "y": y, "f": comp_id})
+        idx, params = [], []
+        for _, g in df.groupby("f"):
+            if g["T"].nunique()<3: 
+                continue
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", OptimizeWarning)
+                    popt, pcov = curve_fit(metal_oxide_law, g["T"], g["y"], bounds=([1e-6, 0, 1e-12],[np.inf, 4.0, np.inf]), maxfev=5000)
+            except RuntimeError:
+                continue
+            A, n, B = popt[0], popt[1], popt[2]
+            idx.append(g.index[0]) # need to check if an index of 0 is fine 
+            params.append([np.log(A), np.log(B/A), n]) # according to the calculate conductivity equation 
+
+        X_indexed = torch.FloatTensor(X_values[idx]).to(device)
+        y_params = torch.FloatTensor(params).to(device)
+        std_y_params = y_params.std(0, keepdim=True) 
+
+        # stage 1 training 
+        opt = optim.Adam(self.model.parameters(), lr=lr)
+        self.model.train()
+        for epoch in range(epochs):
+            opt.zero_grad()
+            predicted_parameters = torch.cat(self._extract_params(self.model(X_indexed)), dim=1)
+            mse_value = (((predicted_parameters - y_params) / std_y_params ) **2)
+            mse_value.mean().backward()
+            opt.step()
+
+
     def _build_network(self) -> nn.Module:
         class MetalArchitecture(nn.Module):
             def __init__(self, n_input_features, num_neurons_config, act, out_act, dropout_rate):
@@ -354,9 +230,7 @@ class MetalPINN:
             xscale_before_impute: bool = True,
             loss_function: str = "mse",
             use_scheduler: bool = True,
-            pretrain_epochs: int = 0,               # 0 disables the warm start
-            pretrain_lr: Optional[float] = None,    # defaults to lr
-            pretrain_identifiable_only: bool = True,
+            warm_start_epochs: int = 200,
             verbose = False,):
 
         self.verbose = verbose
@@ -381,22 +255,9 @@ class MetalPINN:
         y_train = train_target[self.target_name]
         y_train_np = np.asarray(y_train)
 
-        # Stage 1: supervise (lnA, lnBrel, n) directly before the physics loss.
-        if pretrain_epochs and pretrain_epochs > 0:
-            ws = metal_warmstart_targets(
-                train_df, train_target, self.target_name,
-                n_max=4.0, identifiable_only=pretrain_identifiable_only,
-            )
-            if ws is not None and len(ws["rows"]) >= 5:
-                _run_pretrain(
-                    self, X_train_final[ws["rows"]], ws["params"], ws["weights"],
-                    epochs=pretrain_epochs,
-                    lr=(lr if pretrain_lr is None else pretrain_lr),
-                    weight_decay=self.weight_decay, batch_size=batch_size,
-                    verbose=verbose,
-                )
-            else:
-                print("[pretrain] skipped: too few compositions with usable parameters")
+        if warm_start_epochs: 
+            print("Performing warm start on the neural network")
+            self.warm_start(X_train_final, np.asarray(train_temp),  y_train_np, epochs=warm_start_epochs, lr=lr)
 
         X_train_tensor = torch.FloatTensor(X_train_final).to(device)
         y_train_tensor = torch.FloatTensor(y_train_np).unsqueeze(1).to(device)
@@ -560,12 +421,12 @@ class MetalPINN:
             'dropout_rate': self.dropout_rate,
         }
         torch.save(state, filename)
-        print(f"Model saved to {filename}")
+        print(f"Model saved")
 
     @staticmethod
     def load(filename: str) -> "MetalPINN":
         """Load a saved model checkpoint created by `save()`."""
-        print(f"Loading model from {filename}")
+        print(f"Loading model")
 
         try:
             state = torch.load(filename, map_location=device, weights_only=False)
@@ -643,6 +504,34 @@ class SemiconductorPINN:
             return nn.Identity()
         else: 
             raise ValueError("Invalid Activation Function Used")
+    
+    def warm_start(self, X_values, temps, y, epochs=100, lr=1e-3):
+        # grouping by composition
+        uniques, row_id = np.unique(X_values, axis=0, return_inverse=True)
+        df = pd.DataFrame({"T": temps, "y": y, "f": row_id})
+        idx, params = [], []
+        for _, g in df.groupby("f"):
+            if g["T"].nunique()<2: 
+                continue 
+            slope, intercept = np.polyfit(1/g["T"], g["y"], 1)
+            idx.append(g.index[0]) # need to check if an index of 0 is actually good
+            params.append([intercept * _LN10, -slope * _LN10 * K_BOLTZ])
+        
+        X_indexed = torch.FloatTensor(X_values[idx]).to(device)
+        y = torch.FloatTensor(params).to(device)
+        std_y = y.std(0, keepdim=True)
+
+        # stage 1 training, warm start training
+        opt = optim.Adam(self.model.parameters(), lr=lr)
+        self.model.train()
+        for n in range(epochs): 
+            opt.zero_grad()
+            predicted_parameters = torch.cat(self._extract_params(self.model(X_indexed)), dim=1)
+            mse_value = (((predicted_parameters - y) / std_y)**2)
+            mse_value.mean().backward()
+            opt.step()
+            
+          
     def _build_network(self) -> nn.Module:
         class SemiconductorArchitecture(nn.Module):
             def __init__(self, n_input_features, num_neurons_config, act, out_act, dropout_rate):
@@ -757,8 +646,7 @@ class SemiconductorPINN:
             xscale_before_impute: bool = True,
             loss_function: str = "mse",
             use_scheduler: bool = False,
-            pretrain_epochs: int = 0,               # 0 disables the warm start
-            pretrain_lr: Optional[float] = None,    # defaults to lr
+            warm_start_epochs: int=40,
             verbose = False,):
 
         self.verbose = verbose
@@ -769,7 +657,6 @@ class SemiconductorPINN:
 
         train_temp= train_df["temp"]
         train_temp_tensor = torch.FloatTensor(train_temp.values).unsqueeze(1).to(device)
-
         X_train = train_df[self.features]
         X_train_np = np.asarray(X_train, dtype=float)
         if self.scale_impute is not None:
@@ -780,19 +667,11 @@ class SemiconductorPINN:
         y_train = train_target[self.target_name]
         y_train_np = np.asarray(y_train)
 
-        # Stage 1: supervise (lnA, Ea) directly before the physics loss.
-        if pretrain_epochs and pretrain_epochs > 0:
-            ws = semiconductor_warmstart_targets(train_df, train_target, self.target_name)
-            if ws is not None and len(ws["rows"]) >= 5:
-                _run_pretrain(
-                    self, X_train_final[ws["rows"]], ws["params"], ws["weights"],
-                    epochs=pretrain_epochs,
-                    lr=(lr if pretrain_lr is None else pretrain_lr),
-                    weight_decay=self.weight_decay, batch_size=batch_size,
-                    verbose=verbose,
-                )
-            else:
-                print("[pretrain] skipped: too few compositions with usable parameters")
+        # do a warm start of the network 
+        if warm_start_epochs: 
+            print("Performing warm start on the neural network")
+            self.warm_start(X_train_final, np.asarray(train_temp),  y_train_np, epochs=warm_start_epochs, lr=lr)
+
 
         X_train_tensor = torch.FloatTensor(X_train_final).to(device)
         y_train_tensor = torch.FloatTensor(y_train_np).unsqueeze(1).to(device)
@@ -959,11 +838,11 @@ class SemiconductorPINN:
             'dropout_rate': self.dropout_rate,
         }
         torch.save(state, filename)
-        print(f"Model saved to {filename}")
+        print(f"Model saved")
 
     @staticmethod
     def load(filename: str) -> "SemiconductorPINN":
-        print(f"Loading model from {filename}")
+        print(f"Loading model.")
 
         try:
             state = torch.load(filename, map_location=device, weights_only=False)
