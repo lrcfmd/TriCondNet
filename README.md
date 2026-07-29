@@ -19,6 +19,7 @@ The MODNet comparison (TriMODNet) uses the original MODNet implementation and ne
 - `hyperparameterisation/` - Bayesian optimisation file for TriCondNet and TriMODNet parameters. 
 - `nestedcv_demonstration/` - Numbered notebooks for generating features from input training data, and the comparison of TriCondNet and TriMODNet performance via a nested cross validation protocol.
 - `deployment_demonstration/` - Deployment demonstration of TriCondNet. This includes numbered notebooks to extract hyperparameters from nested cross validation, retraining TriCondNet on the full 100% of the training data, and demonstrating the model in inference mode with a set of example formulae and temperatures.
+- `matbench_LightGBM` - Benchmarking a standard LightGBM classifier via Matbench's "matbench_expt_is_metal" task. Random search is used for hyperparameter optimisation.
 
 ## Usage
 See the notebooks in `nestedcv_demonstration/` for a minimal nested cross-validation example, and `deployment_demonstration/` for training and using the final ensemble.
